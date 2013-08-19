@@ -55,7 +55,6 @@ import Text.Pandoc.Readers.LaTeX ( rawLaTeXInline, rawLaTeXBlock )
 import Text.Pandoc.Readers.HTML ( htmlTag, htmlInBalanced, isInlineTag, isBlockTag,
                                   isTextTag, isCommentTag )
 import Text.Pandoc.Biblio (processBiblio)
-import qualified Text.CSL as CSL
 import Data.Monoid (mconcat, mempty)
 import Control.Applicative ((<$>), (<*), (*>), (<$))
 import Control.Monad
@@ -1797,11 +1796,10 @@ rawHtmlInline = do
 cite :: MarkdownParser (F Inlines)
 cite = do
   guardEnabled Ext_citations
-  getOption readerReferences >>= guard . not . null
-  citations <- textualCite <|> normalCite
-  return $ flip B.cite mempty <$> citations
+  citations <- textualCite <|> (fmap (flip B.cite mempty) <$> normalCite)
+  return citations
 
-textualCite :: MarkdownParser (F [Citation])
+textualCite :: MarkdownParser (F Inlines)
 textualCite = try $ do
   (_, key) <- citeKey
   let first = Citation{ citationId      = key
@@ -1813,8 +1811,12 @@ textualCite = try $ do
                       }
   mbrest <- option Nothing $ try $ spnl >> Just <$> normalCite
   case mbrest of
-       Just rest  -> return $ (first:) <$> rest
-       Nothing    -> option (return [first]) $ bareloc first
+       Just rest -> return $ (flip B.cite mempty . (first:)) <$> rest
+       Nothing   -> (fmap (flip B.cite mempty) <$> bareloc first) <|>
+                    return (do st <- askF
+                               return $ case M.lookup key (stateExamples st) of
+                                              Just n -> B.str (show n)
+                                              _      -> B.cite [first] mempty)
 
 bareloc :: Citation -> MarkdownParser (F [Citation])
 bareloc c = try $ do
@@ -1846,8 +1848,6 @@ citeKey = try $ do
   let internal p = try $ p >>~ lookAhead (letter <|> digit)
   rest <- many $ letter <|> digit <|> internal (oneOf ":.#$%&-_+?<>~/")
   let key = first:rest
-  citations' <- map CSL.refId <$> getOption readerReferences
-  guard $ key `elem` citations'
   return (suppress_author, key)
 
 suffix :: MarkdownParser (F Inlines)
