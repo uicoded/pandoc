@@ -1796,8 +1796,11 @@ rawHtmlInline = do
 cite :: MarkdownParser (F Inlines)
 cite = do
   guardEnabled Ext_citations
-  citations <- textualCite <|> (fmap (flip B.cite mempty) <$> normalCite)
+  citations <- textualCite <|> (fmap (flip B.cite unknownC) <$> normalCite)
   return citations
+
+unknownC :: Inlines
+unknownC = B.str "???"
 
 textualCite :: MarkdownParser (F Inlines)
 textualCite = try $ do
@@ -1811,12 +1814,12 @@ textualCite = try $ do
                       }
   mbrest <- option Nothing $ try $ spnl >> Just <$> normalCite
   case mbrest of
-       Just rest -> return $ (flip B.cite mempty . (first:)) <$> rest
-       Nothing   -> (fmap (flip B.cite mempty) <$> bareloc first) <|>
+       Just rest -> return $ (flip B.cite unknownC . (first:)) <$> rest
+       Nothing   -> (fmap (flip B.cite unknownC) <$> bareloc first) <|>
                     return (do st <- askF
                                return $ case M.lookup key (stateExamples st) of
                                               Just n -> B.str (show n)
-                                              _      -> B.cite [first] mempty)
+                                              _      -> B.cite [first] unknownC)
 
 bareloc :: Citation -> MarkdownParser (F [Citation])
 bareloc c = try $ do
