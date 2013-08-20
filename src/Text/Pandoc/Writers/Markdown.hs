@@ -33,6 +33,7 @@ Markdown:  <http://daringfireball.net/projects/markdown/>
 module Text.Pandoc.Writers.Markdown (writeMarkdown, writePlain) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Walk
+import Text.Pandoc.Builder (deleteMeta)
 import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Shared
 import Text.Pandoc.Writers.Shared
@@ -132,6 +133,7 @@ plainTitleBlock tit auths dat =
   dat <> cr
 
 yamlMetadataBlock :: Value -> Doc
+yamlMetadataBlock (Object h) | H.null h = empty
 yamlMetadataBlock v = "---" $$ (jsonToYaml v) $$ "..."
 
 jsonToYaml :: Value -> Doc
@@ -167,7 +169,13 @@ pandocToMarkdown opts (Pandoc meta blocks) = do
   metadata <- metaToJSON opts
                (fmap (render colwidth) . blockListToMarkdown opts)
                (fmap (render colwidth) . inlineListToMarkdown opts)
-               meta
+               (if isEnabled Ext_citations opts
+                   then deleteMeta "references" meta
+                   else meta)
+  topMeta <- metaToJSON opts{ writerVariables = [] }
+               (fmap (render colwidth) . blockListToMarkdown opts)
+               (fmap (render colwidth) . inlineListToMarkdown opts)
+               (deleteMeta "references" meta)
   let title' = maybe empty text $ getField "title" metadata
   let authors' = maybe [] (map text) $ getField "author" metadata
   let date' = maybe empty text $ getField "date" metadata
@@ -175,11 +183,11 @@ pandocToMarkdown opts (Pandoc meta blocks) = do
                         True | isPlain ->
                                 plainTitleBlock title' authors' date'
                              | isEnabled Ext_yaml_metadata_block opts ->
-                                 yamlMetadataBlock metadata
+                                 yamlMetadataBlock topMeta
                              | isEnabled Ext_pandoc_title_block opts ->
                                  pandocTitleBlock title' authors' date'
                              | isEnabled Ext_mmd_title_block opts ->
-                                 mmdTitleBlock metadata
+                                 mmdTitleBlock topMeta
                              | otherwise -> empty
                         False -> empty
   let headerBlocks = filter isHeaderBlock blocks
