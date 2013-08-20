@@ -711,17 +711,20 @@ inlineToMarkdown opts (LineBreak)
   | isEnabled Ext_escaped_line_breaks opts = return $ "\\" <> cr
   | otherwise                              = return $ "  " <> cr
 inlineToMarkdown _ Space = return space
-inlineToMarkdown opts (Cite (c:cs) lst@[RawInline "latex" _])
+inlineToMarkdown opts (Cite [] lst) = inlineListToMarkdown opts lst
+inlineToMarkdown opts (Cite (c:cs) lst)
   | not (isEnabled Ext_citations opts) = inlineListToMarkdown opts lst
-  | citationMode c == AuthorInText = do
-    suffs <- inlineListToMarkdown opts $ citationSuffix c
-    rest <- mapM convertOne cs
-    let inbr = suffs <+> joincits rest
-        br   = if isEmpty inbr then empty else char '[' <> inbr <> char ']'
-    return $ text ("@" ++ citationId c) <+> br
-  | otherwise = do
-    cits <- mapM convertOne (c:cs)
-    return $ text "[" <> joincits cits <> text "]"
+  | otherwise =
+      if citationMode c == AuthorInText
+         then do
+           suffs <- inlineListToMarkdown opts $ citationSuffix c
+           rest <- mapM convertOne cs
+           let inbr = suffs <+> joincits rest
+               br   = if isEmpty inbr then empty else char '[' <> inbr <> char ']'
+           return $ text ("@" ++ citationId c) <+> br
+         else do
+           cits <- mapM convertOne (c:cs)
+           return $ text "[" <> joincits cits <> text "]"
   where
         joincits = hcat . intersperse (text "; ") . filter (not . isEmpty)
         convertOne Citation { citationId      = k
@@ -738,7 +741,6 @@ inlineToMarkdown opts (Cite (c:cs) lst@[RawInline "latex" _])
            return $ pdoc <+> r
         modekey SuppressAuthor = "-"
         modekey _              = ""
-inlineToMarkdown opts (Cite _ lst) = inlineListToMarkdown opts lst
 inlineToMarkdown opts (Link txt (src, tit)) = do
   linktext <- inlineListToMarkdown opts txt
   let linktitle = if null tit
