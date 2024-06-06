@@ -1,24 +1,6 @@
-{-
-Copyright (C) 2013 John MacFarlane <jgm@berkeley.edu>
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
--}
-
 {- |
    Module      : Text.Pandoc.Process
-   Copyright   : Copyright (C) 2013 John MacFarlane
+   Copyright   : Copyright (C) 2013-2023 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -29,77 +11,102 @@ ByteString variant of 'readProcessWithExitCode'.
 -}
 module Text.Pandoc.Process (pipeProcess)
 where
-import System.Process
-import System.Exit (ExitCode (..))
-import Control.Exception
-import System.IO (hClose, hFlush)
-import Control.Concurrent (putMVar, takeMVar, newEmptyMVar, forkIO)
+import Control.Concurrent (MVar, forkIO, killThread, newEmptyMVar, putMVar,
+                           takeMVar)
+import Control.Exception (SomeException (..))
+import qualified Control.Exception as E
 import Control.Monad (unless)
+import Control.DeepSeq (rnf)
 import qualified Data.ByteString.Lazy as BL
+import Foreign.C (Errno (Errno), ePIPE)
+import GHC.IO.Exception (IOErrorType(..), IOException(..))
+import System.Exit (ExitCode (..))
+import System.IO (hClose)
+import System.Process
 
 {- |
 Version of 'System.Process.readProcessWithExitCode' that uses lazy bytestrings
 instead of strings and allows setting environment variables.
 
 @readProcessWithExitCode@ creates an external process, reads its
-standard output and standard error strictly, waits until the process
-terminates, and then returns the 'ExitCode' of the process,
-the standard output, and the standard error.
+standard output strictly, waits until the process
+terminates, and then returns the 'ExitCode' of the process
+and the standard output.  stderr is inherited from the parent.
 
 If an asynchronous exception is thrown to the thread executing
-@readProcessWithExitCode@. The forked process will be terminated and
+@readProcessWithExitCode@, the forked process will be terminated and
 @readProcessWithExitCode@ will wait (block) until the process has been
 terminated.
--}
 
+This function was adapted from @readProcessWithExitCode@ of module
+System.Process, package process-1.6.3.0. The original code is BSD
+licensed and © University of Glasgow 2004-2008.
+-}
 pipeProcess
     :: Maybe [(String, String)] -- ^ environment variables
     -> FilePath                 -- ^ Filename of the executable (see 'proc' for details)
     -> [String]                 -- ^ any arguments
     -> BL.ByteString            -- ^ standard input
-    -> IO (ExitCode,BL.ByteString,BL.ByteString) -- ^ exitcode, stdout, stderr
-pipeProcess mbenv cmd args input =
-    mask $ \restore -> do
-      (Just inh, Just outh, Just errh, pid) <- createProcess (proc cmd args)
-                                                   { env     = mbenv,
-                                                     std_in  = CreatePipe,
-                                                     std_out = CreatePipe,
-                                                     std_err = CreatePipe }
-      flip onException
-        (do hClose inh; hClose outh; hClose errh;
-            terminateProcess pid; waitForProcess pid) $ restore $ do
-        -- fork off a thread to start consuming stdout
+    -> IO (ExitCode,BL.ByteString) -- ^ exitcode, stdout
+pipeProcess mbenv cmd args input = do
+    let cp_opts = (proc cmd args)
+                  { env     = mbenv
+                  , std_in  = CreatePipe
+                  , std_out = CreatePipe
+                  , std_err = Inherit
+                  }
+    withCreateProcess cp_opts $
+      \mbInh mbOuth _ pid -> do
+        let (inh, outh) =
+             case (mbInh, mbOuth) of
+                  (Just i, Just o) -> (i, o)
+                  (Nothing, _)     -> error "withCreateProcess no inh"
+                  (_, Nothing)     -> error "withCreateProcess no outh"
+
         out <- BL.hGetContents outh
-        waitOut <- forkWait $ evaluate $ BL.length out
 
-        -- fork off a thread to start consuming stderr
-        err <- BL.hGetContents errh
-        waitErr <- forkWait $ evaluate $ BL.length err
+        -- fork off threads to start consuming stdout & stderr
+        withForkWait (E.evaluate $ rnf out) $ \waitOut -> do
 
-        -- now write and flush any input
-        let writeInput = do
-              unless (BL.null input) $ do
-                BL.hPutStr inh input
-                hFlush inh
-              hClose inh
+          -- now write any input
+          unless (BL.null input) $
+            ignoreSigPipe $ BL.hPutStr inh input
+          -- hClose performs implicit hFlush, and thus may trigger a SIGPIPE
+          ignoreSigPipe $ hClose inh
 
-        writeInput
+          -- wait on the output
+          waitOut
 
-        -- wait on the output
-        waitOut
-        waitErr
-
-        hClose outh
-        hClose errh
+          hClose outh
 
         -- wait on the process
         ex <- waitForProcess pid
 
-        return (ex, out, err)
+        return (ex, out)
 
-forkWait :: IO a -> IO (IO a)
-forkWait a = do
-  res <- newEmptyMVar
-  _ <- mask $ \restore -> forkIO $ try (restore a) >>= putMVar res
-  return (takeMVar res >>= either (\ex -> throwIO (ex :: SomeException)) return)
+-- | Fork a thread while doing something else, but kill it if there's an
+-- exception.
+--
+-- This is important in the cases above because we want to kill the thread
+-- that is holding the Handle lock, because when we clean up the process we
+-- try to close that handle, which could otherwise deadlock.
+--
+-- This function was copied verbatim from module System.Process of package
+-- process-1.6.3.0.
+withForkWait :: IO () -> (IO () ->  IO a) -> IO a
+withForkWait async body = do
+  waitVar <- newEmptyMVar :: IO (MVar (Either SomeException ()))
+  E.mask $ \restore -> do
+    tid <- forkIO $ E.try (restore async) >>= putMVar waitVar
+    let wait = takeMVar waitVar >>= either E.throwIO return
+    restore (body wait) `E.onException` killThread tid
 
+-- This function was copied verbatim from module System.Process of package
+-- process-1.6.3.0.
+ignoreSigPipe :: IO () -> IO ()
+ignoreSigPipe = E.handle $ \e ->
+  case e of
+    IOError { ioe_type  = ResourceVanished
+            , ioe_errno = Just ioe }
+      | Errno ioe == ePIPE -> return ()
+    _ -> E.throwIO e

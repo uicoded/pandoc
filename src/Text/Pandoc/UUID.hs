@@ -1,24 +1,6 @@
-{-
-Copyright (C) 2010 John MacFarlane <jgm@berkeley.edu>
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
--}
-
 {- |
    Module      : Text.Pandoc.UUID
-   Copyright   : Copyright (C) 2010 John MacFarlane
+   Copyright   : Copyright (C) 2010-2023 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -29,13 +11,13 @@ UUID generation using Version 4 (random method) described
 in RFC4122. See http://tools.ietf.org/html/rfc4122
 -}
 
-module Text.Pandoc.UUID ( UUID, getRandomUUID ) where
+module Text.Pandoc.UUID ( UUID(..), getRandomUUID ) where
 
-import Text.Printf ( printf )
-import System.Random ( randomIO )
+import Data.Bits (clearBit, setBit)
 import Data.Word
-import Data.Bits ( setBit, clearBit )
-import Control.Monad ( liftM )
+import System.Random (RandomGen, randoms)
+import Text.Printf (printf)
+import Text.Pandoc.Class.PandocMonad
 
 data UUID = UUID Word8 Word8 Word8 Word8 Word8 Word8 Word8 Word8
                  Word8 Word8 Word8 Word8 Word8 Word8 Word8 Word8
@@ -64,14 +46,16 @@ instance Show UUID where
    printf "%02x" o ++
    printf "%02x" p
 
-getRandomUUID :: IO UUID
-getRandomUUID = do
-  let getRN :: a -> IO Word8
-      getRN _ = liftM fromIntegral (randomIO :: IO Int)
-  [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p] <- mapM getRN ([1..16] :: [Int])
-  -- set variant
-  let i' = i `setBit` 7 `clearBit` 6
-  -- set version (0100 for random)
-  let g' = g `clearBit` 7 `setBit` 6 `clearBit` 5 `clearBit` 4
-  return $ UUID a b c d e f g' h i' j k l m n o p
+getUUID :: RandomGen g => g -> UUID
+getUUID gen =
+  case take 16 (randoms gen :: [Word8]) of
+       [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p] ->
+         -- set variant
+         let i' = i `setBit` 7 `clearBit` 6
+         -- set version (0100 for random)
+             g' = g `clearBit` 7 `setBit` 6 `clearBit` 5 `clearBit` 4
+         in  UUID a b c d e f g' h i' j k l m n o p
+       _ -> error "not enough random numbers for UUID" -- should not happen
 
+getRandomUUID :: PandocMonad m => m UUID
+getRandomUUID = getUUID <$> newStdGen

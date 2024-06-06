@@ -1,320 +1,139 @@
-{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, CPP,
-    OverloadedStrings, GeneralizedNewtypeDeriving #-}
-{-
-Copyright (C) 2009-2013 John MacFarlane <jgm@berkeley.edu>
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
--}
-
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
 {- |
    Module      : Text.Pandoc.Templates
-   Copyright   : Copyright (C) 2009-2013 John MacFarlane
+   Copyright   : Copyright (C) 2009-2023 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
    Stability   : alpha
    Portability : portable
 
-A simple templating system with variable substitution and conditionals.
-The following program illustrates its use:
+Utility functions for working with pandoc templates.
 
-> {-# LANGUAGE OverloadedStrings #-}
-> import Data.Text
-> import Data.Aeson
-> import Text.Pandoc.Templates
->
-> data Employee = Employee { firstName :: String
->                          , lastName  :: String
->                          , salary    :: Maybe Int }
-> instance ToJSON Employee where
->   toJSON e = object [ "name" .= object [ "first" .= firstName e
->                                        , "last"  .= lastName e ]
->                     , "salary" .= salary e ]
->
-> employees :: [Employee]
-> employees = [ Employee "John" "Doe" Nothing
->             , Employee "Omar" "Smith" (Just 30000)
->             , Employee "Sara" "Chen" (Just 60000) ]
->
-> template :: Template
-> template = either error id $ compileTemplate
->   "$for(employee)$Hi, $employee.name.first$. $if(employee.salary)$You make $employee.salary$.$else$No salary data.$endif$$sep$\n$endfor$"
->
-> main = putStrLn $ renderTemplate template $ object ["employee" .= employees ]
+'WithDefaultPartials' and 'WithPartials' are Monad wrappers. Wrapping
+these around an instance of 'PandocMonad' gives different instances of
+'TemplateMonad', with different search behaviors when retrieving
+partials.
 
-A slot for an interpolated variable is a variable name surrounded
-by dollar signs.  To include a literal @$@ in your template, use
-@$$@.  Variable names must begin with a letter and can contain letters,
-numbers, @_@, @-@, and @.@.
+To compile a template and limit partial search to pandoc’s data files,
+use @runWithDefaultPartials (compileTemplate ...)@.
 
-The values of variables are determined by a JSON object that is
-passed as a parameter to @renderTemplate@.  So, for example,
-@title@ will return the value of the @title@ field, and
-@employee.salary@ will return the value of the @salary@ field
-of the object that is the value of the @employee@ field.
+To compile a template and allow partials to be found locally (either on
+the file system or via HTTP, in the event that the main template has an
+absolute URL), ue @runWithPartials (compileTemplate ...)@.
 
-The value of a variable will be indented to the same level as the
-variable.
-
-A conditional begins with @$if(variable_name)$@ and ends with @$endif$@.
-It may optionally contain an @$else$@ section.  The if section is
-used if @variable_name@ has a non-null value, otherwise the else section
-is used.
-
-Conditional keywords should not be indented, or unexpected spacing
-problems may occur.
-
-The @$for$@ keyword can be used to iterate over an array.  If
-the value of the associated variable is not an array, a single
-iteration will be performed on its value.
-
-You may optionally specify separators using @$sep$@, as in the
-example above.
+'getTemplate' seeks a template locally, or via HTTP if the template has
+an absolute URL, falling back to the data files if not found.
 
 -}
 
-module Text.Pandoc.Templates ( renderTemplate
-                             , renderTemplate'
-                             , TemplateTarget(..)
-                             , varListToJSON
+module Text.Pandoc.Templates ( Template
+                             , WithDefaultPartials(..)
+                             , WithPartials(..)
                              , compileTemplate
-                             , Template
-                             , getDefaultTemplate ) where
+                             , renderTemplate
+                             , getTemplate
+                             , getDefaultTemplate
+                             , compileDefaultTemplate
+                             ) where
 
-import Data.Char (isAlphaNum)
-import Control.Monad (guard, when)
-import Data.Aeson (ToJSON(..), Value(..))
-import qualified Data.Attoparsec.Text as A
-import Data.Attoparsec.Text (Parser)
-import Control.Applicative
-import qualified Data.Text as T
+import System.FilePath ((<.>), (</>), takeFileName)
+import Text.DocTemplates (Template, TemplateMonad(..), compileTemplate, renderTemplate)
+import Text.Pandoc.Class.CommonState (CommonState(..))
+import Text.Pandoc.Class.PandocMonad (PandocMonad, fetchItem,
+                                      getCommonState, modifyCommonState,
+                                      toTextM)
+import Text.Pandoc.Data (readDataFile)
+import Control.Monad.Except (catchError, throwError)
 import Data.Text (Text)
-import Data.Text.Encoding (encodeUtf8)
-import Text.Pandoc.Compat.Monoid ((<>), Monoid(..))
-import Data.List (intersperse, nub)
-import System.FilePath ((</>), (<.>))
-import qualified Data.Map as M
-import qualified Data.HashMap.Strict as H
-import Data.Foldable (toList)
-import qualified Control.Exception.Extensible as E (try, IOException)
-#if MIN_VERSION_blaze_html(0,5,0)
-import Text.Blaze.Html (Html)
-import Text.Blaze.Internal (preEscapedText)
-#else
-import Text.Blaze (preEscapedText, Html)
-#endif
-import Data.ByteString.Lazy (ByteString, fromChunks)
-import Text.Pandoc.Shared (readDataFileUTF8)
+import qualified Data.Text as T
+import Text.Pandoc.Error
+import System.IO.Error (isDoesNotExistError)
+
+-- | Wrap a Monad in this if you want partials to
+-- be taken only from the default data files.
+newtype WithDefaultPartials m a = WithDefaultPartials { runWithDefaultPartials :: m a }
+ deriving (Functor, Applicative, Monad)
+
+-- | Wrap a Monad in this if you want partials to
+-- be looked for locally (or, when the main template
+-- is at a URL, via HTTP), falling back to default data files.
+newtype WithPartials m a = WithPartials { runWithPartials :: m a }
+ deriving (Functor, Applicative, Monad)
+
+instance PandocMonad m => TemplateMonad (WithDefaultPartials m) where
+  getPartial fp = WithDefaultPartials $
+    readDataFile ("templates" </> takeFileName fp) >>= toTextM fp
+
+instance PandocMonad m => TemplateMonad (WithPartials m) where
+  getPartial fp = WithPartials $ getTemplate fp
+
+-- | Retrieve text for a template.
+getTemplate :: PandocMonad m => FilePath -> m Text
+getTemplate tp =
+  ((do surl <- stSourceURL <$> getCommonState
+       -- we don't want to look for templates remotely
+       -- unless the full URL is specified:
+       modifyCommonState $ \st -> st{
+         stSourceURL = Nothing }
+       (bs, _) <- fetchItem $ T.pack tp
+       modifyCommonState $ \st -> st{
+         stSourceURL = surl }
+       return bs)
+   `catchError`
+   (\e -> case e of
+             PandocResourceNotFound _ ->
+                -- see #5987 on reason for takeFileName
+                readDataFile ("templates" </> takeFileName tp)
+             PandocIOError _ ioe | isDoesNotExistError ioe ->
+                -- see #5987 on reason for takeFileName
+                readDataFile ("templates" </> takeFileName tp)
+             _ -> throwError e)) >>= toTextM tp
 
 -- | Get default template for the specified writer.
-getDefaultTemplate :: (Maybe FilePath) -- ^ User data directory to search first
-                   -> String           -- ^ Name of writer
-                   -> IO (Either E.IOException String)
-getDefaultTemplate user writer = do
-  let format = takeWhile (`notElem` "+-") writer  -- strip off extensions
+getDefaultTemplate :: PandocMonad m
+                   => Text           -- ^ Name of writer
+                   -> m Text
+getDefaultTemplate format = do
   case format of
-       "native" -> return $ Right ""
-       "json"   -> return $ Right ""
-       "docx"   -> return $ Right ""
-       "odt"    -> getDefaultTemplate user "opendocument"
-       "markdown_strict"   -> getDefaultTemplate user "markdown"
-       "multimarkdown"     -> getDefaultTemplate user "markdown"
-       "markdown_github"   -> getDefaultTemplate user "markdown"
-       "markdown_mmd"      -> getDefaultTemplate user "markdown"
-       "markdown_phpextra" -> getDefaultTemplate user "markdown"
-       _        -> let fname = "templates" </> "default" <.> format
-                   in  E.try $ readDataFileUTF8 user fname
+       "native"  -> return ""
+       "csljson" -> return ""
+       "json"    -> return ""
+       "docx"    -> return ""
+       "fb2"     -> return ""
+       "pptx"    -> return ""
+       "ipynb"   -> return ""
+       "asciidoctor" -> getDefaultTemplate "asciidoc"
+       "asciidoc_legacy" -> getDefaultTemplate "asciidoc"
+       "odt"     -> getDefaultTemplate "opendocument"
+       "html"    -> getDefaultTemplate "html5"
+       "docbook" -> getDefaultTemplate "docbook5"
+       "epub"    -> getDefaultTemplate "epub3"
+       "beamer"  -> getDefaultTemplate "latex"
+       "jats"    -> getDefaultTemplate "jats_archiving"
+       "markdown_strict"   -> getDefaultTemplate "markdown"
+       "multimarkdown"     -> getDefaultTemplate "markdown"
+       "markdown_github"   -> getDefaultTemplate "markdown"
+       "markdown_mmd"      -> getDefaultTemplate "markdown"
+       "markdown_phpextra" -> getDefaultTemplate "markdown"
+       "gfm"               -> getDefaultTemplate "commonmark"
+       "commonmark_x"      -> getDefaultTemplate "commonmark"
+       _        -> do
+         let fname = "templates" </> "default" <.> T.unpack format
+         readDataFile fname >>= toTextM fname
 
-newtype Template = Template { unTemplate :: Value -> Text }
-                 deriving Monoid
-
-type Variable = [Text]
-
-class TemplateTarget a where
-  toTarget :: Text -> a
-
-instance TemplateTarget Text where
-  toTarget = id
-
-instance TemplateTarget String where
-  toTarget = T.unpack
-
-instance TemplateTarget ByteString where
-  toTarget = fromChunks . (:[]) . encodeUtf8
-
-instance TemplateTarget Html where
-  toTarget = preEscapedText
-
-varListToJSON :: [(String, String)] -> Value
-varListToJSON assoc = toJSON $ M.fromList assoc'
-  where assoc' = [(T.pack k, toVal [T.pack z | (y,z) <- assoc,
-                                                not (null z),
-                                                y == k])
-                        | k <- nub $ map fst assoc ]
-        toVal [x] = toJSON x
-        toVal []  = Null
-        toVal xs  = toJSON xs
-
-renderTemplate :: (ToJSON a, TemplateTarget b) => Template -> a -> b
-renderTemplate (Template f) context = toTarget $ f $ toJSON context
-
-compileTemplate :: Text -> Either String Template
-compileTemplate template = A.parseOnly pTemplate template
-
--- | Like 'renderTemplate', but compiles the template first,
--- raising an error if compilation fails.
-renderTemplate' :: (ToJSON a, TemplateTarget b) => String -> a -> b
-renderTemplate' template =
-  renderTemplate (either error id $ compileTemplate $ T.pack template)
-
-var :: Variable -> Template
-var = Template . resolveVar
-
-resolveVar :: Variable -> Value -> Text
-resolveVar var' val =
-  case multiLookup var' val of
-       Just (Array vec) -> mconcat $ map (resolveVar []) $ toList vec
-       Just (String t)  -> T.stripEnd t
-       Just (Number n)  -> T.pack $ show n
-       Just (Bool True) -> "true"
-       Just _           -> mempty
-       Nothing          -> mempty
-
-multiLookup :: [Text] -> Value -> Maybe Value
-multiLookup [] x = Just x
-multiLookup (v:vs) (Object o) = H.lookup v o >>= multiLookup vs
-multiLookup _ _ = Nothing
-
-lit :: Text -> Template
-lit = Template . const
-
-cond :: Variable -> Template -> Template -> Template
-cond var' (Template ifyes) (Template ifno) = Template $ \val ->
-  case resolveVar var' val of
-       "" -> ifno val
-       _  -> ifyes val
-
-iter :: Variable -> Template -> Template -> Template
-iter var' template sep = Template $ \val -> unTemplate
-  (case multiLookup var' val of
-           Just (Array vec) -> mconcat $ intersperse sep
-                                       $ map (setVar template var')
-                                       $ toList vec
-           Just x           -> setVar template var' x
-           Nothing          -> mempty) val
-
-setVar :: Template -> Variable -> Value -> Template
-setVar (Template f) var' val = Template $ f . replaceVar var' val
-
-replaceVar :: Variable -> Value -> Value -> Value
-replaceVar []     new _          = new
-replaceVar (v:vs) new (Object o) =
-  Object $ H.adjust (\x -> replaceVar vs new x) v o
-replaceVar _ _ old = old
-
---- parsing
-
-pTemplate :: Parser Template
-pTemplate = do
-  sp <- A.option mempty pInitialSpace
-  rest <- mconcat <$> many (pConditional <|>
-                            pFor <|>
-                            pNewline <|>
-                            pVar <|>
-                            pLit <|>
-                            pEscapedDollar)
-  return $ sp <> rest
-
-pLit :: Parser Template
-pLit = lit <$> A.takeWhile1 (\x -> x /='$' && x /= '\n')
-
-pNewline :: Parser Template
-pNewline = do
-  A.char '\n'
-  sp <- A.option mempty pInitialSpace
-  return $ lit "\n" <> sp
-
-pInitialSpace :: Parser Template
-pInitialSpace = do
-  sps <- A.takeWhile1 (==' ')
-  let indentVar = if T.null sps
-                     then id
-                     else indent (T.length sps)
-  v <- A.option mempty $ indentVar <$> pVar
-  return $ lit sps <> v
-
-pEscapedDollar :: Parser Template
-pEscapedDollar = lit "$" <$ A.string "$$"
-
-pVar :: Parser Template
-pVar = var <$> (A.char '$' *> pIdent <* A.char '$')
-
-pIdent :: Parser [Text]
-pIdent = do
-  first <- pIdentPart
-  rest <- many (A.char '.' *> pIdentPart)
-  return (first:rest)
-
-pIdentPart :: Parser Text
-pIdentPart = do
-  first <- A.letter
-  rest <- A.takeWhile (\c -> isAlphaNum c || c == '_' || c == '-')
-  let id' = T.singleton first <> rest
-  guard $ id' `notElem` reservedWords
-  return id'
-
-reservedWords :: [Text]
-reservedWords = ["else","endif","for","endfor","sep"]
-
-skipEndline :: Parser ()
-skipEndline = A.skipWhile (`elem` " \t") >> A.char '\n' >> return ()
-
-pConditional :: Parser Template
-pConditional = do
-  A.string "$if("
-  id' <- pIdent
-  A.string ")$"
-  -- if newline after the "if", then a newline after "endif" will be swallowed
-  multiline <- A.option False (True <$ skipEndline)
-  ifContents <- pTemplate
-  elseContents <- A.option mempty $
-                      do A.string "$else$"
-                         when multiline $ A.option () skipEndline
-                         pTemplate
-  A.string "$endif$"
-  when multiline $ A.option () skipEndline
-  return $ cond id' ifContents elseContents
-
-pFor :: Parser Template
-pFor = do
-  A.string "$for("
-  id' <- pIdent
-  A.string ")$"
-  -- if newline after the "for", then a newline after "endfor" will be swallowed
-  multiline <- A.option False $ skipEndline >> return True
-  contents <- pTemplate
-  sep <- A.option mempty $
-           do A.string "$sep$"
-              when multiline $ A.option () skipEndline
-              pTemplate
-  A.string "$endfor$"
-  when multiline $ A.option () skipEndline
-  return $ iter id' contents sep
-
-indent :: Int -> Template -> Template
-indent 0   x            = x
-indent ind (Template f) = Template $ \val -> indent' (f val)
-  where indent' t = T.concat
-                    $ intersperse ("\n" <> T.replicate ind " ") $ T.lines t
+-- | Get and compile default template for the specified writer.
+-- Raise an error on compilation failure.
+compileDefaultTemplate :: PandocMonad m
+                       => Text
+                       -> m (Template Text)
+compileDefaultTemplate writer = do
+  res <- getDefaultTemplate writer >>=
+          runWithDefaultPartials .
+           compileTemplate ("templates/default." <> T.unpack writer)
+  case res of
+    Left e   -> throwError $ PandocTemplateError (T.pack e)
+    Right t  -> return t

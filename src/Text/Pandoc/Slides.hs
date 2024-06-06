@@ -1,24 +1,7 @@
-{-
-Copyright (C) 2012 John MacFarlane <jgm@berkeley.edu>
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
--}
-
+{-# LANGUAGE OverloadedStrings #-}
 {- |
    Module      : Text.Pandoc.Slides
-   Copyright   : Copyright (C) 2012 John MacFarlane
+   Copyright   : Copyright (C) 2012-2023 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -38,21 +21,30 @@ getSlideLevel = go 6
   where go least (Header n _ _ : x : xs)
                  | n < least && nonHOrHR x = go n xs
                  | otherwise               = go least (x:xs)
+        go least (Div _ bs : xs) = min (go least bs) (go least xs)
         go least (_ : xs) = go least xs
         go least [] = least
-        nonHOrHR (Header _ _ _) = False
-        nonHOrHR (HorizontalRule) = False
-        nonHOrHR _ = True
+        nonHOrHR Header{}       = False
+        nonHOrHR HorizontalRule = False
+        nonHOrHR _              = True
 
--- | Prepare a block list to be passed to hierarchicalize.
+-- | Prepare a block list to be passed to makeSections.
 prepSlides :: Int -> [Block] -> [Block]
-prepSlides slideLevel = ensureStartWithH . splitHrule
+prepSlides slideLevel = ensureStartWithH . splitHrule . extractRefsHeader
   where splitHrule (HorizontalRule : Header n attr xs : ys)
                        | n == slideLevel = Header slideLevel attr xs : splitHrule ys
         splitHrule (HorizontalRule : xs) = Header slideLevel nullAttr [Str "\0"] :
                                            splitHrule xs
         splitHrule (x : xs)              = x : splitHrule xs
         splitHrule []                    = []
+        extractRefsHeader bs             =
+          case reverse bs of
+               (Div ("refs",classes,kvs) (Header n attrs xs : ys) : zs)
+                 -> reverse zs ++ [Header n attrs xs,
+                                   Div ("refs",classes,kvs) ys]
+               _ -> bs
         ensureStartWithH bs@(Header n _ _:_)
+                       | n <= slideLevel = bs
+        ensureStartWithH bs@(Div _ (Header n _ _:_) : _)
                        | n <= slideLevel = bs
         ensureStartWithH bs              = Header slideLevel nullAttr [Str "\0"] : bs
